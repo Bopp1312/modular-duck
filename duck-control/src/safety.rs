@@ -145,8 +145,9 @@ impl LimitRuns {
     }
 }
 
-pub struct Safety<T: RobotIo> {
+pub struct Safety<T: RobotIo<N>, const N: usize = NUM_JOINTS> {
     io: T,
+    joint_limits: [(f64, f64); N],
     config: SafetyConfig,
     /// How long gravity has been past the threshold. Reset by any upright sample.
     falling_for: Duration,
@@ -162,10 +163,11 @@ pub struct Safety<T: RobotIo> {
     deadman_armed: bool,
 }
 
-impl<T: RobotIo> Safety<T> {
+impl<T: RobotIo<N>, const N: usize> Safety<T, N> {
     pub fn new(io: T, config: SafetyConfig) -> Self {
         Self {
             io,
+            joint_limits: [(ACTUATOR_MIN, ACTUATOR_MAX); N],
             config,
             falling_for: Duration::ZERO,
             fallen: false,
@@ -175,7 +177,19 @@ impl<T: RobotIo> Safety<T> {
         }
     }
 
-    pub fn read(&mut self) -> Result<Sensors, IoError> {
+    /// Bind mechanical travel to the backend before any actuation is possible.
+    pub fn for_profile(
+        io: T,
+        config: SafetyConfig,
+        profile: &crate::profile::ValidatedProfile,
+    ) -> Result<Self, crate::profile::ProfileError> {
+        let limits = profile.limits()?;
+        let mut safety = Self::new(io, config);
+        safety.joint_limits = limits;
+        Ok(safety)
+    }
+
+    pub fn read(&mut self) -> Result<Sensors<N>, IoError> {
         self.io.read()
     }
 
@@ -185,7 +199,7 @@ impl<T: RobotIo> Safety<T> {
     /// except through here" a fact the borrow checker enforces rather than a convention. Slow
     /// sensors and IMU diagnostics read rather than write, so they are no threat to that, but
     /// handing out the handle to reach them would be.
-    pub fn slow_sensors(&mut self) -> Result<crate::io::SlowSensors, IoError> {
+    pub fn slow_sensors(&mut self) -> Result<crate::io::SlowSensors<N>, IoError> {
         self.io.slow_sensors()
     }
 
@@ -197,13 +211,11 @@ impl<T: RobotIo> Safety<T> {
         self.io.imu_ready()
     }
 
-    pub fn hardware_errors(&mut self) -> Result<Option<[u8; crate::model::NUM_JOINTS]>, IoError> {
+    pub fn hardware_errors(&mut self) -> Result<Option<[u8; N]>, IoError> {
         self.io.hardware_errors()
     }
 
-    pub fn servo_identity(
-        &mut self,
-    ) -> Result<Option<[crate::io::ServoIdentity; crate::model::NUM_JOINTS]>, IoError> {
+    pub fn servo_identity(&mut self) -> Result<Option<[crate::io::ServoIdentity; N]>, IoError> {
         self.io.servo_identity()
     }
 
@@ -251,7 +263,7 @@ impl<T: RobotIo> Safety<T> {
     /// Debounced in both directions: a robot has to be down for `fall_debounce` to count as
     /// fallen, and one upright sample clears the accumulator. Without the debounce, the
     /// impulse from a firm footfall reads as a fall.
-    pub fn observe(&mut self, sensors: &Sensors, dt: Duration) {
+    pub fn observe(&mut self, sensors: &Sensors<N>, dt: Duration) {
         // An orientation filter that has not converged does not get a vote.
         //
         // The SFLP filter needs a few seconds of samples before its quaternion means
@@ -362,8 +374,8 @@ impl<T: RobotIo> Safety<T> {
     /// safety ones, so they are passed in rather than second-guessed here.
     pub fn apply(
         &mut self,
-        targets: [f64; NUM_JOINTS],
-        hold: [f64; NUM_JOINTS],
+        targets: [f64; N],
+        hold: [f64; N],
         running_gain: u16,
     ) -> Result<Applied, IoError> {
         let mut applied = Applied::default();
@@ -388,6 +400,12 @@ impl<T: RobotIo> Safety<T> {
                 );
             }
             applied.limits.push(Limit::NotFinite);
+            if !hold.iter().all(|v| v.is_finite()) {
+                return Err(IoError::Bus("non-finite fallback hold pose".into()));
+            }
+            let hold = std::array::from_fn(|i| {
+                hold[i].clamp(self.joint_limits[i].0, self.joint_limits[i].1)
+            });
             self.io.write(&JointTargets::new(hold))?;
             return Ok(applied);
         }
@@ -401,7 +419,8 @@ impl<T: RobotIo> Safety<T> {
         let mut clamped_joints = 0u32;
         let mut first_clamped = None;
         for (joint, value) in safe.iter_mut().enumerate() {
-            let clamped = value.clamp(ACTUATOR_MIN, ACTUATOR_MAX);
+            let (min, max) = self.joint_limits[joint];
+            let clamped = value.clamp(min, max);
             if clamped != *value {
                 clamped_joints += 1;
                 first_clamped.get_or_insert(joint);

@@ -15,6 +15,7 @@ pub mod model;
 pub mod obs;
 pub mod pickup;
 pub mod policy;
+pub mod profile;
 pub mod safety;
 /// A robot in MuJoCo, over TCP — the backend `robotd-design.md` §9 deferred.
 pub mod sim;

@@ -1,8 +1,7 @@
 //! The robot, as data.
 //!
-//! One variant — **alpha** — because that is the only robot that exists. Every shipped
-//! policy is `alpha_*`; v1/v1.5/v1.6 are history. A second revision becomes a second set
-//! of tables, which is honest until there is a second robot to generalise from.
+//! The built-in **alpha** description used by the shipped daemon. Other morphologies
+//! are described by [`crate::profile`]; these constants remain alpha-specific.
 //!
 //! The numeric values here are lifted from `microduck_runtime`'s `motor.rs`, where they
 //! were measured against hardware rather than derived. Re-deriving them from a datasheet

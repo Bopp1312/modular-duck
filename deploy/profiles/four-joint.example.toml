@@ -1,0 +1,40 @@
+# Contract example only: these names, IDs, angles and scales are placeholders.
+# This file is not consumed by robotd and does not enable actuation.
+# Planned hardware: Raspberry Pi 5, U2D2, four XL430s, Waveshare Sense HAT (B).
+name = "four-joint-example"
+
+[policy]
+joints = ["joint_1", "joint_2", "joint_3", "joint_4"]
+commands = ["vx", "vy", "yaw_rate"]
+
+[[joints]]
+name = "joint_1"
+id = 1
+home = 0.0
+min = -0.5
+max = 0.5
+action_scale = 0.25
+
+[[joints]]
+name = "joint_2"
+id = 2
+home = 0.0
+min = -0.5
+max = 0.5
+action_scale = 0.25
+
+[[joints]]
+name = "joint_3"
+id = 3
+home = 0.0
+min = -0.5
+max = 0.5
+action_scale = 0.25
+
+[[joints]]
+name = "joint_4"
+id = 4
+home = 0.0
+min = -0.5
+max = 0.5
+action_scale = 0.25

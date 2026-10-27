@@ -11,27 +11,28 @@
 use crate::imu::ImuData;
 use crate::model::NUM_JOINTS;
 
-/// One atomic sample of the robot.
+/// One sample of the robot, with the actuator count shared by its backend and safety layer.
+/// The default count preserves the built-in alpha interface.
 #[derive(Debug, Clone, Copy, PartialEq)]
-pub struct Sensors {
-    /// Joint angles in radians, indexed as [`crate::model::JOINT_NAMES`].
-    pub positions: [f64; NUM_JOINTS],
+pub struct Sensors<const N: usize = NUM_JOINTS> {
+    /// Joint angles in radians, in profile order (alpha uses [`crate::model::JOINT_NAMES`]).
+    pub positions: [f64; N],
     /// Joint velocities, rad/s.
-    pub velocities: [f64; NUM_JOINTS],
+    pub velocities: [f64; N],
     /// Present current magnitude, mA. The sign is dropped by whichever driver fills this —
     /// [`crate::bus`] takes the absolute value as it unpacks the word — because what every
     /// consumer so far wants is load. It is not recoverable from `velocities`: a joint holding
     /// a squat or a foot taking weight is near-zero velocity at non-zero current.
-    pub currents_ma: [f64; NUM_JOINTS],
+    pub currents_ma: [f64; N],
     pub imu: ImuData,
 }
 
-impl Default for Sensors {
+impl<const N: usize> Default for Sensors<N> {
     fn default() -> Self {
         Self {
-            positions: [0.0; NUM_JOINTS],
-            velocities: [0.0; NUM_JOINTS],
-            currents_ma: [0.0; NUM_JOINTS],
+            positions: [0.0; N],
+            velocities: [0.0; N],
+            currents_ma: [0.0; N],
             imu: ImuData::default(),
         }
     }
@@ -39,12 +40,12 @@ impl Default for Sensors {
 
 /// What the loop commands. Position control only — alpha has no velocity-mode joints.
 #[derive(Debug, Clone, Copy, PartialEq)]
-pub struct JointTargets {
-    pub positions: [f64; NUM_JOINTS],
+pub struct JointTargets<const N: usize = NUM_JOINTS> {
+    pub positions: [f64; N],
 }
 
-impl JointTargets {
-    pub fn new(positions: [f64; NUM_JOINTS]) -> Self {
+impl<const N: usize> JointTargets<N> {
+    pub fn new(positions: [f64; N]) -> Self {
         Self { positions }
     }
 }
@@ -80,7 +81,7 @@ pub type Result<T> = std::result::Result<T, IoError>;
 /// does not drain and a motor does not heat up in 20 ms, so the tick would be paying for a
 /// second bus transaction to learn nothing new.
 #[derive(Debug, Clone, Copy, PartialEq)]
-pub struct SlowSensors {
+pub struct SlowSensors<const N: usize = NUM_JOINTS> {
     /// Mean supply voltage across the servos, in volts — the only battery measurement the
     /// robot has, since there is no fuel gauge anywhere on the hat.
     pub volts: f64,
@@ -89,7 +90,7 @@ pub struct SlowSensors {
     /// Per-joint rather than an average because the interesting case is one joint carrying
     /// the load — a knee holding a squat runs far hotter than the mouth, and a mean over
     /// fifteen servos hides exactly the servo about to latch its overheat shutdown.
-    pub temps_c: [f64; NUM_JOINTS],
+    pub temps_c: [f64; N],
 }
 
 /// IMU reads that came back byte-for-byte identical to their predecessor.
@@ -112,10 +113,10 @@ pub struct ImuStale {
     pub run: u64,
 }
 
-pub trait RobotIo {
-    /// One transaction: joints and IMU together.
-    fn read(&mut self) -> Result<Sensors>;
-    fn write(&mut self, targets: &JointTargets) -> Result<()>;
+pub trait RobotIo<const N: usize = NUM_JOINTS> {
+    /// Joints and orientation for one control tick. A backend may use separate buses.
+    fn read(&mut self) -> Result<Sensors<N>>;
+    fn write(&mut self, targets: &JointTargets<N>) -> Result<()>;
 
     /// Whether [`Sensors::velocities`] from this backend is a measurement.
     ///
@@ -123,7 +124,7 @@ pub trait RobotIo {
     /// so in the sample itself — it reports zeros, which is what a robot standing perfectly
     /// still reports. The wire draws that distinction (`RobotState::velocities` is absent
     /// rather than zero when nothing measured it), and this is how it learns which it has:
-    /// a real bus answers yes, `FakeIo` answers no until a test states what the servos report.
+    /// a real bus answers yes, `FakeIo<N>` answers no until a test states what the servos report.
     ///
     /// Defaulted true because a backend that reads real servos has nothing to declare.
     fn measures_velocity(&self) -> bool {
@@ -169,7 +170,7 @@ pub trait RobotIo {
     /// 144–146, past the end of the contiguous block [`Self::read`] fetches, so reaching them
     /// costs a transaction of its own — about a millisecond. Negligible once a second, 5% of
     /// the budget at 50 Hz.
-    fn slow_sensors(&mut self) -> Result<SlowSensors>;
+    fn slow_sensors(&mut self) -> Result<SlowSensors<N>>;
 
     /// Diagnostics the bus keeps about itself. Default to "nothing to report" so a fake or a
     /// future backend is not obliged to invent them.
@@ -192,14 +193,14 @@ pub trait RobotIo {
     /// the vet book counts each bit as it comes up.
     ///
     /// `None` from a backend with no servos to ask, which is the default.
-    fn hardware_errors(&mut self) -> Result<Option<[u8; NUM_JOINTS]>> {
+    fn hardware_errors(&mut self) -> Result<Option<[u8; N]>> {
         Ok(None)
     }
 
     /// Each servo's model number and firmware version (registers 0 and 6), in joint order. Read
     /// once a start, for the vet book: a servo has no serial number, so this is all the identity
     /// it has. `None` from a backend with no servos, which is the default.
-    fn servo_identity(&mut self) -> Result<Option<[ServoIdentity; NUM_JOINTS]>> {
+    fn servo_identity(&mut self) -> Result<Option<[ServoIdentity; N]>> {
         Ok(None)
     }
 }
@@ -216,15 +217,15 @@ pub struct ServoIdentity {
 /// Always compiled — it is what the test suite runs against, and it is why `cargo test`
 /// needs no hardware, no network and no Docker. Positions echo back whatever was last
 /// written, so a loop driving it behaves like a servo that tracks perfectly.
-pub struct FakeIo {
-    sensors: Sensors,
+pub struct FakeIo<const N: usize = NUM_JOINTS> {
+    sensors: Sensors<N>,
     /// Set to make the next [`RobotIo::read`] fail, then cleared. For exercising the
     /// loop's error path without a flaky bus.
     pub fail_next_read: bool,
     /// Reads still to fail before this one starts answering, decremented per read. Models a
     /// robot whose servos are not powered yet, and then are.
     pub fail_reads: u32,
-    pub last_written: Option<JointTargets>,
+    pub last_written: Option<JointTargets<N>>,
     pub reads: usize,
     pub writes: usize,
     /// Last gain commanded, so a test can tell "went limp" from "stopped commanding".
@@ -235,7 +236,7 @@ pub struct FakeIo {
     /// What [`RobotIo::slow_sensors`] reports. Mid-pack and hand-warm by default so `--fake`
     /// shows a plausible robot; set it to exercise a flat pack or a cooking servo. `None`
     /// fails the read, which is what a robot with no bus does.
-    pub slow: Option<SlowSensors>,
+    pub slow: Option<SlowSensors<N>>,
     /// When true, `read` reports the last written targets as the present positions.
     track_targets: bool,
     /// Whether a test has stated what the servos report for velocity and load. Until one has,
@@ -253,16 +254,16 @@ pub struct FakeIo {
     pub reboots: Vec<u8>,
 }
 
-impl Default for FakeIo {
+impl<const N: usize> Default for FakeIo<N> {
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl FakeIo {
+impl<const N: usize> FakeIo<N> {
     pub fn new() -> Self {
         Self {
-            sensors: Sensors::default(),
+            sensors: Sensors::<N>::default(),
             fail_next_read: false,
             fail_reads: 0,
             last_written: None,
@@ -272,7 +273,7 @@ impl FakeIo {
             imu_ready: true,
             slow: Some(SlowSensors {
                 volts: 7.4,
-                temps_c: [32.0; NUM_JOINTS],
+                temps_c: [32.0; N],
             }),
             track_targets: true,
             velocity_stated: false,
@@ -284,7 +285,7 @@ impl FakeIo {
     }
 
     /// Start from a known pose — typically [`crate::model::DEFAULT_POSITION`].
-    pub fn at(positions: [f64; NUM_JOINTS]) -> Self {
+    pub fn at(positions: [f64; N]) -> Self {
         let mut io = Self::new();
         io.sensors.positions = positions;
         io
@@ -313,25 +314,25 @@ impl FakeIo {
     /// Unlike positions these are never derived from what was written — a fake that echoed
     /// its own targets back as velocity would make any test of the velocity path pass
     /// vacuously.
-    pub fn set_velocities(&mut self, velocities: [f64; NUM_JOINTS]) {
+    pub fn set_velocities(&mut self, velocities: [f64; N]) {
         self.sensors.velocities = velocities;
         self.velocity_stated = true;
     }
 
     /// Present current per joint, mA. Same rule as [`Self::set_velocities`]: nothing derives
     /// this, so a test has to state what the servos are supposed to be reporting.
-    pub fn set_currents_ma(&mut self, currents_ma: [f64; NUM_JOINTS]) {
+    pub fn set_currents_ma(&mut self, currents_ma: [f64; N]) {
         self.sensors.currents_ma = currents_ma;
         self.load_stated = true;
     }
 
-    pub fn positions(&self) -> [f64; NUM_JOINTS] {
+    pub fn positions(&self) -> [f64; N] {
         self.sensors.positions
     }
 }
 
-impl RobotIo for FakeIo {
-    fn read(&mut self) -> Result<Sensors> {
+impl<const N: usize> RobotIo<N> for FakeIo<N> {
+    fn read(&mut self) -> Result<Sensors<N>> {
         if self.fail_next_read {
             self.fail_next_read = false;
             return Err(IoError::Simulated);
@@ -344,7 +345,7 @@ impl RobotIo for FakeIo {
         Ok(self.sensors)
     }
 
-    fn write(&mut self, targets: &JointTargets) -> Result<()> {
+    fn write(&mut self, targets: &JointTargets<N>) -> Result<()> {
         self.writes += 1;
         self.last_written = Some(*targets);
         if self.track_targets {
@@ -381,7 +382,7 @@ impl RobotIo for FakeIo {
         self.imu_ready
     }
 
-    fn slow_sensors(&mut self) -> Result<SlowSensors> {
+    fn slow_sensors(&mut self) -> Result<SlowSensors<N>> {
         self.slow.ok_or(IoError::Simulated)
     }
 }
@@ -420,7 +421,7 @@ mod tests {
     /// the loop's retry path is untestable.
     #[test]
     fn simulated_read_failure_clears_itself() {
-        let mut io = FakeIo::new();
+        let mut io = FakeIo::<4>::new();
         io.fail_next_read = true;
         assert!(io.read().is_err());
         assert!(io.read().is_ok());

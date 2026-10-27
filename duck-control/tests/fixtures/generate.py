@@ -77,3 +77,9 @@ onnx.save(nan, ROOT / 'nan_state.onnx')
 
 variant('lstm_changed', lambda m: next(x for x in m.graph.initializer if x.name == 'B').CopyFrom(
     nh.from_array(np.full((1, 16), .3, dtype=np.float32), 'B')))
+
+# Different morphologies must exercise the real loader, not only a shape calculator.
+for joints in (4, 24):
+    save(f'profile_{joints}', [h.make_node('Gather', ['obs', 'indices'], ['actions'], axis=1)],
+         [info('obs', [1, 9 + 3 * joints])], [info('actions', [1, joints])],
+         [nh.from_array(np.arange(6, 6 + joints, dtype=np.int64), 'indices')])

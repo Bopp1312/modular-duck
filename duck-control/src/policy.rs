@@ -454,9 +454,50 @@ pub fn validate(path: &Path) -> Result<(), PolicyError> {
     catching_ort_panics(|| open(path).map(drop))
 }
 
+/// The same feed-forward/LSTM loader used by the alpha policy set, with dimensions
+/// taken from a validated robot description instead of the alpha constants.
+pub struct ProfilePolicy {
+    network: Network,
+}
+
+impl ProfilePolicy {
+    pub fn load(
+        path: &Path,
+        profile: &crate::profile::ValidatedProfile,
+    ) -> Result<Self, PolicyError> {
+        ensure_runtime()?;
+        catching_ort_panics(|| {
+            let mut network =
+                open_with_shape(path, profile.observation_len(), profile.action_len())?;
+            network.run_slice(&vec![0.0; profile.observation_len()])?;
+            network.reset();
+            Ok(Self { network })
+        })
+    }
+
+    pub fn infer(&mut self, observation: &[f32]) -> Result<Vec<f32>, PolicyError> {
+        self.network.run_slice(observation)
+    }
+
+    /// Reuse caller-owned action storage on the control thread.
+    pub fn infer_into(
+        &mut self,
+        observation: &[f32],
+        actions: &mut [f32],
+    ) -> Result<(), PolicyError> {
+        self.network.run_into(observation, actions)
+    }
+
+    pub fn reset(&mut self) {
+        self.network.reset();
+    }
+}
+
 /// The mjlab/rsl_rl LSTM export passes state explicitly. Buffers belong to one
 /// session, are allocated at load, and are never shared between policy slots.
 struct Network {
+    observation_len: usize,
+    action_len: usize,
     session: Session,
     state: Option<LstmState>,
     action_name: String,
@@ -478,11 +519,37 @@ impl Network {
     }
 
     fn run(&mut self, observation: &Observation) -> Result<[f32; ACTION_LEN], PolicyError> {
+        let mut actions = [0.0; ACTION_LEN];
+        self.run_into(observation.as_slice(), &mut actions)?;
+        Ok(actions)
+    }
+
+    fn run_slice(&mut self, observation: &[f32]) -> Result<Vec<f32>, PolicyError> {
+        let mut actions = vec![0.0; self.action_len];
+        self.run_into(observation, &mut actions)?;
+        Ok(actions)
+    }
+
+    fn run_into(&mut self, observation: &[f32], result: &mut [f32]) -> Result<(), PolicyError> {
         let fail = |e: String| PolicyError::Inference(format!("{}: {e}", self.path.display()));
-        if !observation.as_slice().iter().all(|v| v.is_finite()) {
+        if result.len() != self.action_len {
+            return Err(fail(format!(
+                "expected {} action slots, got {}",
+                self.action_len,
+                result.len()
+            )));
+        }
+        if observation.len() != self.observation_len {
+            return Err(fail(format!(
+                "expected {} observations, got {}",
+                self.observation_len,
+                observation.len()
+            )));
+        }
+        if !observation.iter().all(|v| v.is_finite()) {
             return Err(fail("non-finite observation".into()));
         }
-        let input = Value::from_array(([1usize, OBS_LEN], observation.as_slice().to_vec()))
+        let input = Value::from_array(([1usize, self.observation_len], observation.to_vec()))
             .map_err(|e| fail(format!("building input: {e}")))?;
         let outputs = match &self.state {
             Some(state) => self.session.run(ort::inputs![
@@ -494,11 +561,9 @@ impl Network {
         let (_, actions) = outputs[self.action_name.as_str()]
             .try_extract_tensor::<f32>()
             .map_err(|e| fail(e.to_string()))?;
-        if actions.len() != ACTION_LEN || !actions.iter().all(|v| v.is_finite()) {
-            return Err(fail("expected 14 finite actions".into()));
+        if actions.len() != self.action_len || !actions.iter().all(|v| v.is_finite()) {
+            return Err(fail(format!("expected {} finite actions", self.action_len)));
         }
-        let mut result = [0.0; ACTION_LEN];
-        result.copy_from_slice(actions);
         if let Some(state) = &mut self.state {
             let (hs, h) = outputs["h_out"]
                 .try_extract_tensor::<f32>()
@@ -523,7 +588,8 @@ impl Network {
             h_in.copy_from_slice(h);
             c_in.copy_from_slice(c);
         }
-        Ok(result)
+        result.copy_from_slice(actions);
+        Ok(())
     }
 }
 
@@ -586,6 +652,14 @@ fn check_matrix(path: &Path, outlet: &ort::value::Outlet, width: usize) -> Resul
 }
 
 fn open(path: &Path) -> Result<Network, PolicyError> {
+    open_with_shape(path, OBS_LEN, ACTION_LEN)
+}
+
+fn open_with_shape(
+    path: &Path,
+    observation_len: usize,
+    action_len: usize,
+) -> Result<Network, PolicyError> {
     let bytes = std::fs::read(path).map_err(|source| PolicyError::Read {
         path: path.to_owned(),
         source,
@@ -602,7 +676,7 @@ fn open(path: &Path) -> Result<Network, PolicyError> {
 
     let inputs = session.inputs();
     let outputs = session.outputs();
-    check_matrix(path, outlet(path, inputs, "obs")?, OBS_LEN)?;
+    check_matrix(path, outlet(path, inputs, "obs")?, observation_len)?;
     let recurrent = match (inputs.len(), outputs.len()) {
         (1, 1) => false,
         (3, 3) => true,
@@ -621,7 +695,7 @@ fn open(path: &Path) -> Result<Network, PolicyError> {
     } else {
         &outputs[0]
     };
-    check_matrix(path, action, ACTION_LEN)?;
+    check_matrix(path, action, action_len)?;
     let action_name = action.name().to_owned();
     let state = if recurrent {
         let mut shapes = Vec::new();
@@ -683,6 +757,8 @@ fn open(path: &Path) -> Result<Network, PolicyError> {
         None
     };
     Ok(Network {
+        observation_len,
+        action_len,
         session,
         state,
         action_name,

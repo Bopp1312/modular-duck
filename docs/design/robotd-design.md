@@ -666,9 +666,9 @@ cannot trip it — reaching 6.6 V requires a genuinely empty pack.
 
 ### 2.5 The robot model
 
-Rust consts for alpha only: 15 joints, Dynamixel IDs `20–24 / 30–34 / 10–14`, names,
-`DEFAULT_POSITION`, and the actuator range. Same tables as the runtime's `motor.rs`, minus the
-three dead variants. There is exactly one robot; a second revision can be a second table.
+The shipped daemon uses the alpha constants: 15 joints, Dynamixel IDs
+`20–24 / 30–34 / 10–14`, names, `DEFAULT_POSITION`, and the actuator range. These are the
+same tables as the runtime's `motor.rs`, minus the three retired variants.
 
 Two of those tables are load-bearing beyond their own crate. `JOINT_NAMES` comes *from*
 `duck-ipc-proto`, because the wire indexes `joints` and `targets` positionally and the two
@@ -676,6 +676,48 @@ orders cannot be allowed to drift — a `const` assertion makes "cannot" true. A
 `DEFAULT_POSITION` must match `HOME_FRAME` in the training env: a policy observes joint
 positions *relative* to the home pose, so a discrepancy here is a constant offset on 14
 observation slots.
+
+#### Library support for other morphologies
+
+`duck-control::profile` accepts strict TOML descriptions of joint names, Dynamixel IDs,
+home positions, mechanical limits, signed action scales, and policy joint/command ordering.
+Validation rejects duplicate IDs/names, unknown policy joints, non-finite values, invalid
+limits, and homes outside those limits. The validated description is immutable.
+
+The policy observation layout is gyro (3), projected gravity (3), home-relative joint
+positions (A), velocities (A), previous raw actions (A), and commands (C): `6 + 3*A + C`.
+Policy order can differ from bus order and can omit joints. Action mapping preserves the
+hold pose of omitted joints. A four-joint policy with three commands therefore has 21
+observations and four actions. This describes a training contract, not a trained policy.
+`ProfilePolicy` uses the existing ONNX loader and its feed-forward/LSTM validation, with
+dimensions from that description. The original alpha policy set still uses 61/14.
+
+`RobotIo<N>`, `Sensors<N>`, `JointTargets<N>`, `SlowSensors<N>`, `FakeIo<N>`,
+`RemoteIo<N>`, and `Safety<T, N>` share a compile-time actuator count, defaulting to 15.
+`Safety::for_profile` checks the count and installs per-joint limits before accepting the
+backend. Those limits also apply to the fallback hold pose; a non-finite fallback is refused.
+The simulator handshake announces N and rejects sensor arrays whose lengths disagree.
+This is library-level support: N is selected by a Rust caller, not dynamically by robotd.
+
+Validate the supplied contract example without accessing hardware:
+
+```bash
+cargo run -p duck-control --example check-profile -- deploy/profiles/four-joint.example.toml
+```
+
+**Integration is unfinished.** `robotd` does not load this profile yet. Its state machine,
+body-specific behaviors, IPC metadata and clients, physical XL330 bus backend, and Pi
+deployment configuration still assume the Microduck. There is no XL430/U2D2 backend or
+ICM-20948 driver here yet. The example contains placeholder joint names, IDs and angles;
+it is not a deployable configuration. No IPC contract has changed in this library step.
+Connecting profiles to the daemon requires publishing joint metadata and updating clients
+together, with an API version bump and an explicit install consequence.
+
+The requested hardware is a Pi 5 with U2D2 and four XL430s. The supplied product listing
+appears to identify a Waveshare Sense HAT (B); its [manufacturer documentation](https://www.waveshare.com/wiki/Sense_HAT_%28B%29)
+specifies an ICM-20948 at I²C address 0x68. This needs sensing independent of the Dynamixel
+bus and a calibrated sensor-to-body transform. The four joint roles, their measured home
+positions/travel limits and the IMU mounting orientation remain to be supplied.
 
 ## 3. The API
 

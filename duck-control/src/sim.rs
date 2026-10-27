@@ -62,7 +62,7 @@ enum Request<'a> {
     #[serde(rename = "read")]
     Read,
     #[serde(rename = "write")]
-    Write { targets: &'a [f64; NUM_JOINTS] },
+    Write { targets: &'a [f64] },
     #[serde(rename = "gain")]
     Gain { kp: u16 },
     #[serde(rename = "torque")]
@@ -84,14 +84,14 @@ struct Hello {
 /// and drift. What crosses the wire is the robot's own units.
 #[derive(Debug, Deserialize)]
 struct SensorFrame {
-    positions: [f64; NUM_JOINTS],
-    velocities: [f64; NUM_JOINTS],
+    positions: Vec<f64>,
+    velocities: Vec<f64>,
     /// Optional, and `None` is not a simulator reporting no load: a MuJoCo model without
     /// actuator force to report simply omits it, and filling the gap with zeros would put
     /// "every joint unloaded" on the state stream. [`RobotIo::measures_load`] carries the
     /// difference out of here.
     #[serde(default)]
-    currents_ma: Option<[f64; NUM_JOINTS]>,
+    currents_ma: Option<Vec<f64>>,
     imu: ImuFrame,
 }
 
@@ -105,7 +105,7 @@ struct ImuFrame {
 #[derive(Debug, Deserialize)]
 struct SlowFrame {
     volts: f64,
-    temps_c: [f64; NUM_JOINTS],
+    temps_c: Vec<f64>,
 }
 
 /// An acknowledgement, so a write that the simulator refused is not silently a write that worked.
@@ -116,7 +116,7 @@ struct Ack {
 }
 
 /// A robot in MuJoCo, reached over TCP.
-pub struct RemoteIo {
+pub struct RemoteIo<const N: usize = NUM_JOINTS> {
     addr: String,
     link: Option<Link>,
     /// Reported once rather than every tick a disconnected loop runs.
@@ -132,7 +132,7 @@ struct Link {
     read: BufReader<TcpStream>,
 }
 
-impl RemoteIo {
+impl<const N: usize> RemoteIo<N> {
     /// Name the simulator. Nothing is connected until the first call — a daemon must start whether
     /// or not the simulator is up yet, exactly as it starts without a robot on the bus.
     pub fn at(addr: impl Into<String>) -> Self {
@@ -186,7 +186,7 @@ impl RemoteIo {
                 &mut link,
                 &Request::Hello {
                     protocol: PROTOCOL,
-                    joints: NUM_JOINTS,
+                    joints: N,
                 },
             )?;
             if hello.protocol != PROTOCOL {
@@ -269,14 +269,18 @@ fn acked(ack: Ack, what: &str) -> Result<()> {
     }
 }
 
-impl RobotIo for RemoteIo {
-    fn read(&mut self) -> Result<Sensors> {
+impl<const N: usize> RobotIo<N> for RemoteIo<N> {
+    fn read(&mut self) -> Result<Sensors<N>> {
         let frame: SensorFrame = self.call(&Request::Read)?;
         self.load_reported = frame.currents_ma.is_some();
         Ok(Sensors {
-            positions: frame.positions,
-            velocities: frame.velocities,
-            currents_ma: frame.currents_ma.unwrap_or([0.0; NUM_JOINTS]),
+            positions: frame_array(frame.positions, "positions")?,
+            velocities: frame_array(frame.velocities, "velocities")?,
+            currents_ma: frame
+                .currents_ma
+                .map(|values| frame_array(values, "currents_ma"))
+                .transpose()?
+                .unwrap_or([0.0; N]),
             imu: ImuData {
                 gyro: frame.imu.gyro,
                 gravity: frame.imu.gravity,
@@ -285,7 +289,7 @@ impl RobotIo for RemoteIo {
         })
     }
 
-    fn write(&mut self, targets: &JointTargets) -> Result<()> {
+    fn write(&mut self, targets: &JointTargets<N>) -> Result<()> {
         let ack: Ack = self.call(&Request::Write {
             targets: &targets.positions,
         })?;
@@ -317,13 +321,25 @@ impl RobotIo for RemoteIo {
         Ok(())
     }
 
-    fn slow_sensors(&mut self) -> Result<SlowSensors> {
+    fn slow_sensors(&mut self) -> Result<SlowSensors<N>> {
         let frame: SlowFrame = self.call(&Request::Slow)?;
         Ok(SlowSensors {
             volts: frame.volts,
-            temps_c: frame.temps_c,
+            temps_c: frame_array(frame.temps_c, "temps_c")?,
         })
     }
+}
+
+fn frame_array<const N: usize>(values: Vec<f64>, what: &'static str) -> Result<[f64; N]> {
+    let got = values.len();
+    if !values.iter().all(|v| v.is_finite()) {
+        return Err(IoError::Bus(format!("non-finite {what}")));
+    }
+    values.try_into().map_err(|_| IoError::ShortRead {
+        what,
+        expected: N,
+        got,
+    })
 }
 
 #[cfg(test)]
@@ -331,6 +347,38 @@ mod tests {
     use super::*;
     use std::net::TcpListener;
     use std::thread;
+
+    #[test]
+    fn four_joint_body_negotiates_and_transfers_four_joints() {
+        let (addr, server) = simulator(vec![vec![
+            r#"{"protocol":1}"#,
+            r#"{"positions":[1,2,3,4],"velocities":[0,0,0,0],"imu":{"gyro":[0,0,0],"gravity":[0,0,-1],"quat":[1,0,0,0]}}"#,
+            r#"{}"#,
+            r#"{"volts":12.0,"temps_c":[30,31,32,33]}"#,
+        ]]);
+        let mut io = RemoteIo::<4>::at(addr);
+        assert_eq!(io.read().unwrap().positions, [1.0, 2.0, 3.0, 4.0]);
+        io.write(&JointTargets::new([0.1; 4])).unwrap();
+        assert_eq!(io.slow_sensors().unwrap().temps_c, [30.0, 31.0, 32.0, 33.0]);
+        let heard = server.join().unwrap();
+        let hello: serde_json::Value = serde_json::from_str(&heard[0]).unwrap();
+        assert_eq!(hello["joints"], 4);
+        let write: serde_json::Value = serde_json::from_str(&heard[2]).unwrap();
+        assert_eq!(write["targets"], serde_json::json!([0.1, 0.1, 0.1, 0.1]));
+    }
+
+    #[test]
+    fn frame_sizes_are_checked_before_any_joint_is_used() {
+        assert!(matches!(
+            frame_array::<4>(vec![0.0; 3], "positions"),
+            Err(IoError::ShortRead {
+                expected: 4,
+                got: 3,
+                ..
+            })
+        ));
+        assert!(frame_array::<4>(vec![f64::NAN; 4], "positions").is_err());
+    }
 
     /// A simulator made of canned answers: one script per connection, one answer per request.
     ///
@@ -375,7 +423,7 @@ mod tests {
     #[test]
     fn a_read_carries_the_sensors_the_loop_expects() {
         let (addr, sim) = simulator(vec![vec![HELLO, SENSORS]]);
-        let mut io = RemoteIo::at(addr);
+        let mut io = RemoteIo::<NUM_JOINTS>::at(addr);
         let sensors = io.read().expect("a sensor frame");
         assert_eq!(sensors.positions[0], 0.1);
         assert_eq!(sensors.velocities[NUM_JOINTS - 1], 0.5);
@@ -397,7 +445,7 @@ mod tests {
             r#""imu":{"gyro":[0,0,0],"gravity":[0,0,-1],"quat":[1,0,0,0]}}"#
         );
         let (addr, sim) = simulator(vec![vec![HELLO, NO_LOAD, SENSORS]]);
-        let mut io = RemoteIo::at(addr);
+        let mut io = RemoteIo::<NUM_JOINTS>::at(addr);
 
         io.read().expect("a frame with no load block");
         assert!(!io.measures_load(), "an absent block is not a measurement");
@@ -417,7 +465,7 @@ mod tests {
     #[test]
     fn the_targets_cross_in_joint_order() {
         let (addr, sim) = simulator(vec![vec![HELLO, OK]]);
-        let mut io = RemoteIo::at(addr);
+        let mut io = RemoteIo::<NUM_JOINTS>::at(addr);
         let mut positions = [0.0; NUM_JOINTS];
         positions[2] = -0.4579;
         io.write(&JointTargets::new(positions)).expect("a write");
@@ -431,7 +479,7 @@ mod tests {
     #[test]
     fn a_protocol_mismatch_names_both_versions() {
         let (addr, _sim) = simulator(vec![vec![r#"{"protocol":99}"#]]);
-        let mut io = RemoteIo::at(addr);
+        let mut io = RemoteIo::<NUM_JOINTS>::at(addr);
         let error = io
             .read()
             .expect_err("a mismatch is fatal to the connection");
@@ -443,7 +491,7 @@ mod tests {
     #[test]
     fn a_refusal_is_an_error_rather_than_a_silent_success() {
         let (addr, _sim) = simulator(vec![vec![HELLO, r#"{"error":"torque is disabled"}"#]]);
-        let mut io = RemoteIo::at(addr);
+        let mut io = RemoteIo::<NUM_JOINTS>::at(addr);
         let error = io
             .set_torque(true)
             .expect_err("a refusal must not read as done");
@@ -456,7 +504,7 @@ mod tests {
         // restarts it — and the ducks are expected to survive that. The first connection dies
         // mid-read; the second is expected to be made without anyone asking.
         let (addr, sim) = simulator(vec![vec![HELLO], vec![HELLO, SENSORS]]);
-        let mut io = RemoteIo::at(addr);
+        let mut io = RemoteIo::<NUM_JOINTS>::at(addr);
 
         io.read().expect_err("the simulator hung up");
         let sensors = io.read().expect("reconnected on the next call");
@@ -475,7 +523,7 @@ mod tests {
         // Not merely an error: a half-read line means the two ends disagree about where a message
         // starts, and a line protocol cannot resynchronise except by starting again.
         let (addr, sim) = simulator(vec![vec![HELLO, "not json"], vec![HELLO, SENSORS]]);
-        let mut io = RemoteIo::at(addr);
+        let mut io = RemoteIo::<NUM_JOINTS>::at(addr);
         io.read().expect_err("garbage is an error");
         io.read().expect("a fresh connection, not a wedged one");
 
